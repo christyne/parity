@@ -1,9 +1,9 @@
 [package]
 description = "Parity built-in dapps."
 name = "parity-ui-dev"
-version = "1.4.0"
+version = "1.9.0"
 license = "GPL-3.0"
-authors = ["Ethcore <admin@ethcore.io>"]
+authors = ["Parity Technologies <admin@parity.io>"]
 build = "build.rs"
 
 [features]
@@ -11,8 +11,8 @@ default = ["with-syntex"]
 with-syntex = ["parity-dapps-glue/with-syntex"]
 
 [build-dependencies]
-parity-dapps-glue = "1.4"
+parity-dapps-glue = "1.9"
 
 [dependencies]
-parity-dapps-glue = "1.4"
+parity-dapps-glue = "1.9"
 

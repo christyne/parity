@@ -1,4 +1,4 @@
-// Copyright 2015, 2016 Ethcore (UK) Ltd.
+// Copyright 2015-2017 Parity Technologies (UK) Ltd.
 // This file is part of Parity.
 
 // Parity is free software: you can redistribute it and/or modify
@@ -15,7 +15,7 @@
 // along with Parity.  If not, see <http://www.gnu.org/licenses/>.
 
 use std::collections::BTreeMap;
-use ethsync::{PeerInfo as SyncPeerInfo, TransactionStats as SyncTransactionStats};
+use ethsync::{self, PeerInfo as SyncPeerInfo, TransactionStats as SyncTransactionStats};
 use serde::{Serialize, Serializer};
 use v1::types::{U256, H512};
 
@@ -37,9 +37,6 @@ pub struct SyncInfo {
 	/// Warp sync snpashot chunks processed.
 	#[serde(rename="warpChunksProcessed")]
 	pub warp_chunks_processed: Option<U256>,
-	/// Describes the gap in the blockchain, if there is one: (first, last)
-	#[serde(rename="blockGap")]
-	pub block_gap: Option<(U256, U256)>,
 }
 
 /// Peers info
@@ -85,18 +82,51 @@ pub struct PeerNetworkInfo {
 #[derive(Default, Debug, Serialize)]
 pub struct PeerProtocolsInfo {
 	/// Ethereum protocol information
-	pub eth: Option<PeerEthereumProtocolInfo>,
+	pub eth: Option<EthProtocolInfo>,
+	/// PIP protocol information.
+	pub pip: Option<PipProtocolInfo>,
 }
 
 /// Peer Ethereum protocol information
 #[derive(Default, Debug, Serialize)]
-pub struct PeerEthereumProtocolInfo {
+pub struct EthProtocolInfo {
 	/// Negotiated ethereum protocol version
 	pub version: u32,
 	/// Peer total difficulty if known
 	pub difficulty: Option<U256>,
 	/// SHA3 of peer best block hash
 	pub head: String,
+}
+
+impl From<ethsync::EthProtocolInfo> for EthProtocolInfo {
+	fn from(info: ethsync::EthProtocolInfo) -> Self {
+		EthProtocolInfo {
+			version: info.version,
+			difficulty: info.difficulty.map(Into::into),
+			head: info.head.hex(),
+		}
+	}
+}
+
+/// Peer PIP protocol information
+#[derive(Default, Debug, Serialize)]
+pub struct PipProtocolInfo {
+	/// Negotiated PIP protocol version
+	pub version: u32,
+	/// Peer total difficulty
+	pub difficulty: U256,
+	/// SHA3 of peer best block hash
+	pub head: String,
+}
+
+impl From<ethsync::PipProtocolInfo> for PipProtocolInfo {
+	fn from(info: ethsync::PipProtocolInfo) -> Self {
+		PipProtocolInfo {
+			version: info.version,
+			difficulty: info.difficulty.into(),
+			head: info.head.hex(),
+		}
+	}
 }
 
 /// Sync status
@@ -109,7 +139,7 @@ pub enum SyncStatus {
 }
 
 impl Serialize for SyncStatus {
-	fn serialize<S>(&self, serializer: &mut S) -> Result<(), S::Error>
+	fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
 	where S: Serializer {
 		match *self {
 			SyncStatus::Info(ref info) => info.serialize(serializer),
@@ -140,11 +170,8 @@ impl From<SyncPeerInfo> for PeerInfo {
 				local_address: p.local_address,
 			},
 			protocols: PeerProtocolsInfo {
-				eth: Some(PeerEthereumProtocolInfo {
-					version: p.eth_version,
-					difficulty: p.eth_difficulty.map(|d| d.into()),
-					head: p.eth_head.hex(),
-				})
+				eth: p.eth_info.map(Into::into),
+				pip: p.pip_info.map(Into::into),
 			},
 		}
 	}
@@ -157,22 +184,30 @@ impl From<SyncTransactionStats> for TransactionStats {
 			propagated_to: s.propagated_to
 				.into_iter()
 				.map(|(id, count)| (id.into(), count))
-				.collect()
+				.collect(),
 		}
 	}
+}
+
+/// Chain status.
+#[derive(Default, Debug, Serialize)]
+pub struct ChainStatus {
+	/// Describes the gap in the blockchain, if there is one: (first, last)
+	#[serde(rename="blockGap")]
+	pub block_gap: Option<(U256, U256)>,
 }
 
 #[cfg(test)]
 mod tests {
 	use serde_json;
 	use std::collections::BTreeMap;
-	use super::{SyncInfo, SyncStatus, Peers, TransactionStats};
+	use super::{SyncInfo, SyncStatus, Peers, TransactionStats, ChainStatus};
 
 	#[test]
 	fn test_serialize_sync_info() {
 		let t = SyncInfo::default();
 		let serialized = serde_json::to_string(&t).unwrap();
-		assert_eq!(serialized, r#"{"startingBlock":"0x0","currentBlock":"0x0","highestBlock":"0x0","warpChunksAmount":null,"warpChunksProcessed":null,"blockGap":null}"#);
+		assert_eq!(serialized, r#"{"startingBlock":"0x0","currentBlock":"0x0","highestBlock":"0x0","warpChunksAmount":null,"warpChunksProcessed":null}"#);
 	}
 
 	#[test]
@@ -190,16 +225,19 @@ mod tests {
 
 		let t = SyncStatus::Info(SyncInfo::default());
 		let serialized = serde_json::to_string(&t).unwrap();
-		assert_eq!(serialized, r#"{"startingBlock":"0x0","currentBlock":"0x0","highestBlock":"0x0","warpChunksAmount":null,"warpChunksProcessed":null,"blockGap":null}"#);
+		assert_eq!(serialized, r#"{"startingBlock":"0x0","currentBlock":"0x0","highestBlock":"0x0","warpChunksAmount":null,"warpChunksProcessed":null}"#);
 	}
 
 	#[test]
 	fn test_serialize_block_gap() {
-		let mut t = SyncInfo::default();
+		let mut t = ChainStatus::default();
+		let serialized = serde_json::to_string(&t).unwrap();
+		assert_eq!(serialized, r#"{"blockGap":null}"#);
+
 		t.block_gap = Some((1.into(), 5.into()));
 
 		let serialized = serde_json::to_string(&t).unwrap();
-		assert_eq!(serialized, r#"{"startingBlock":"0x0","currentBlock":"0x0","highestBlock":"0x0","warpChunksAmount":null,"warpChunksProcessed":null,"blockGap":["0x1","0x5"]}"#)
+		assert_eq!(serialized, r#"{"blockGap":["0x1","0x5"]}"#);
 	}
 
 	#[test]
@@ -208,7 +246,7 @@ mod tests {
 			first_seen: 100,
 			propagated_to: map![
 				10.into() => 50
-			]
+			],
 		};
 
 		let serialized = serde_json::to_string(&stats).unwrap();

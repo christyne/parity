@@ -1,4 +1,4 @@
-// Copyright 2015, 2016 Ethcore (UK) Ltd.
+// Copyright 2015-2017 Parity Technologies (UK) Ltd.
 // This file is part of Parity.
 
 // Parity is free software: you can redistribute it and/or modify
@@ -16,7 +16,7 @@
 
 use std::thread;
 use std::time::Duration;
-use std::io::{Read, Write};
+use std::io::{self, Read, Write};
 use std::str::{self, Lines};
 use std::net::{TcpStream, SocketAddr};
 
@@ -25,6 +25,21 @@ pub struct Response {
 	pub headers: Vec<String>,
 	pub headers_raw: String,
 	pub body: String,
+}
+
+impl Response {
+	pub fn assert_header(&self, header: &str, value: &str) {
+		let header = format!("{}: {}", header, value);
+		assert!(self.headers.iter().find(|h| *h == &header).is_some(), "Couldn't find header {} in {:?}", header, &self.headers)
+	}
+
+	pub fn assert_status(&self, status: &str) {
+		assert_eq!(self.status, status.to_owned(), "Got unexpected code. Body: {:?}", self.body);
+	}
+
+	pub fn assert_security_headers_present(&self, port: Option<u16>) {
+		assert_security_headers_present(&self.headers, port)
+	}
 }
 
 pub fn read_block(lines: &mut Lines, all: bool) -> String {
@@ -65,14 +80,23 @@ fn connect(address: &SocketAddr) -> TcpStream {
 
 pub fn request(address: &SocketAddr, request: &str) -> Response {
 	let mut req = connect(address);
-	req.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+	req.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
 	req.write_all(request.as_bytes()).unwrap();
 
-	let mut response = String::new();
-	let _ = req.read_to_string(&mut response);
+	let mut response = Vec::new();
+	loop {
+		let mut chunk = [0; 32 *1024];
+		match req.read(&mut chunk) {
+			Err(ref err) if err.kind() == io::ErrorKind::WouldBlock => break,
+			Err(err) => panic!("Unable to read response: {:?}", err),
+			Ok(0) => break,
+			Ok(read) => response.extend_from_slice(&chunk[..read]),
+		}
+	}
 
+	let response = String::from_utf8_lossy(&response).into_owned();
 	let mut lines = response.lines();
-	let status = lines.next().unwrap().to_owned();
+	let status = lines.next().expect("Expected a response").to_owned();
 	let headers_raw = read_block(&mut lines, false);
 	let headers = headers_raw.split('\n').map(|v| v.to_owned()).collect();
 	let body = read_block(&mut lines, true);
@@ -87,12 +111,7 @@ pub fn request(address: &SocketAddr, request: &str) -> Response {
 
 /// Check if all required security headers are present
 pub fn assert_security_headers_present(headers: &[String], port: Option<u16>) {
-	if let Some(port) = port {
-		assert!(
-			headers.iter().find(|header| header.as_str() == &format!("X-Frame-Options: ALLOW-FROM http://127.0.0.1:{}", port)).is_some(),
-			"X-Frame-Options: ALLOW-FROM missing: {:?}", headers
-		);
-	} else {
+	if let None = port {
 		assert!(
 			headers.iter().find(|header| header.as_str() == "X-Frame-Options: SAMEORIGIN").is_some(),
 			"X-Frame-Options: SAMEORIGIN missing: {:?}", headers
@@ -106,4 +125,8 @@ pub fn assert_security_headers_present(headers: &[String], port: Option<u16>) {
 		headers.iter().find(|header|  header.as_str() == "X-Content-Type-Options: nosniff").is_some(),
 		"X-Content-Type-Options missing: {:?}", headers
 	);
+	assert!(
+		headers.iter().find(|header| header.starts_with("Content-Security-Policy: ")).is_some(),
+		"Content-Security-Policy missing: {:?}", headers
+	)
 }

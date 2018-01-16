@@ -1,4 +1,4 @@
-// Copyright 2015, 2016 Ethcore (UK) Ltd.
+// Copyright 2015-2017 Parity Technologies (UK) Ltd.
 // This file is part of Parity.
 
 // Parity is free software: you can redistribute it and/or modify
@@ -15,10 +15,15 @@
 // along with Parity.  If not, see <http://www.gnu.org/licenses/>.
 
 //! DB backend wrapper for Account trie
-use util::*;
+use std::collections::HashMap;
+use hash::{KECCAK_NULL_RLP, keccak};
+use ethereum_types::H256;
+use kvdb::DBValue;
+use hashdb::HashDB;
 use rlp::NULL_RLP;
 
-static NULL_RLP_STATIC: [u8; 1] = [0x80; 1];
+#[cfg(test)]
+use ethereum_types::Address;
 
 // combines a key with an address hash to ensure uniqueness.
 // leaves the first 96 bits untouched in order to support partial key lookup.
@@ -78,8 +83,9 @@ pub struct AccountDB<'db> {
 
 impl<'db> AccountDB<'db> {
 	/// Create a new AccountDB from an address.
+	#[cfg(test)]
 	pub fn new(db: &'db HashDB, address: &Address) -> Self {
-		Self::from_hash(db, address.sha3())
+		Self::from_hash(db, keccak(address))
 	}
 
 	/// Create a new AcountDB from an address' hash.
@@ -97,14 +103,14 @@ impl<'db> HashDB for AccountDB<'db>{
 	}
 
 	fn get(&self, key: &H256) -> Option<DBValue> {
-		if key == &SHA3_NULL_RLP {
-			return Some(DBValue::from_slice(&NULL_RLP_STATIC));
+		if key == &KECCAK_NULL_RLP {
+			return Some(DBValue::from_slice(&NULL_RLP));
 		}
 		self.db.get(&combine_key(&self.address_hash, key))
 	}
 
 	fn contains(&self, key: &H256) -> bool {
-		if key == &SHA3_NULL_RLP {
+		if key == &KECCAK_NULL_RLP {
 			return true;
 		}
 		self.db.contains(&combine_key(&self.address_hash, key))
@@ -121,10 +127,6 @@ impl<'db> HashDB for AccountDB<'db>{
 	fn remove(&mut self, _key: &H256) {
 		unimplemented!()
 	}
-
-	fn get_aux(&self, hash: &[u8]) -> Option<DBValue> {
-		self.db.get_aux(hash)
-	}
 }
 
 /// DB backend wrapper for Account trie
@@ -135,8 +137,9 @@ pub struct AccountDBMut<'db> {
 
 impl<'db> AccountDBMut<'db> {
 	/// Create a new AccountDB from an address.
+	#[cfg(test)]
 	pub fn new(db: &'db mut HashDB, address: &Address) -> Self {
-		Self::from_hash(db, address.sha3())
+		Self::from_hash(db, keccak(address))
 	}
 
 	/// Create a new AcountDB from an address' hash.
@@ -147,7 +150,7 @@ impl<'db> AccountDBMut<'db> {
 		}
 	}
 
-	#[allow(dead_code)]
+	#[cfg(test)]
 	pub fn immutable(&'db self) -> AccountDB<'db> {
 		AccountDB { db: self.db, address_hash: self.address_hash.clone() }
 	}
@@ -159,14 +162,14 @@ impl<'db> HashDB for AccountDBMut<'db>{
 	}
 
 	fn get(&self, key: &H256) -> Option<DBValue> {
-		if key == &SHA3_NULL_RLP {
-			return Some(DBValue::from_slice(&NULL_RLP_STATIC));
+		if key == &KECCAK_NULL_RLP {
+			return Some(DBValue::from_slice(&NULL_RLP));
 		}
 		self.db.get(&combine_key(&self.address_hash, key))
 	}
 
 	fn contains(&self, key: &H256) -> bool {
-		if key == &SHA3_NULL_RLP {
+		if key == &KECCAK_NULL_RLP {
 			return true;
 		}
 		self.db.contains(&combine_key(&self.address_hash, key))
@@ -174,16 +177,16 @@ impl<'db> HashDB for AccountDBMut<'db>{
 
 	fn insert(&mut self, value: &[u8]) -> H256 {
 		if value == &NULL_RLP {
-			return SHA3_NULL_RLP.clone();
+			return KECCAK_NULL_RLP.clone();
 		}
-		let k = value.sha3();
+		let k = keccak(value);
 		let ak = combine_key(&self.address_hash, &k);
 		self.db.emplace(ak, DBValue::from_slice(value));
 		k
 	}
 
 	fn emplace(&mut self, key: H256, value: DBValue) {
-		if key == SHA3_NULL_RLP {
+		if key == KECCAK_NULL_RLP {
 			return;
 		}
 		let key = combine_key(&self.address_hash, &key);
@@ -191,23 +194,11 @@ impl<'db> HashDB for AccountDBMut<'db>{
 	}
 
 	fn remove(&mut self, key: &H256) {
-		if key == &SHA3_NULL_RLP {
+		if key == &KECCAK_NULL_RLP {
 			return;
 		}
 		let key = combine_key(&self.address_hash, key);
 		self.db.remove(&key)
-	}
-
-	fn insert_aux(&mut self, hash: Vec<u8>, value: Vec<u8>) {
-		self.db.insert_aux(hash, value);
-	}
-
-	fn get_aux(&self, hash: &[u8]) -> Option<DBValue> {
-		self.db.get_aux(hash)
-	}
-
-	fn remove_aux(&mut self, hash: &[u8]) {
-		self.db.remove_aux(hash);
 	}
 }
 
@@ -219,14 +210,14 @@ impl<'db> HashDB for Wrapping<'db> {
 	}
 
 	fn get(&self, key: &H256) -> Option<DBValue> {
-		if key == &SHA3_NULL_RLP {
-			return Some(DBValue::from_slice(&NULL_RLP_STATIC));
+		if key == &KECCAK_NULL_RLP {
+			return Some(DBValue::from_slice(&NULL_RLP));
 		}
 		self.0.get(key)
 	}
 
 	fn contains(&self, key: &H256) -> bool {
-		if key == &SHA3_NULL_RLP {
+		if key == &KECCAK_NULL_RLP {
 			return true;
 		}
 		self.0.contains(key)
@@ -253,14 +244,14 @@ impl<'db> HashDB for WrappingMut<'db>{
 	}
 
 	fn get(&self, key: &H256) -> Option<DBValue> {
-		if key == &SHA3_NULL_RLP {
-			return Some(DBValue::from_slice(&NULL_RLP_STATIC));
+		if key == &KECCAK_NULL_RLP {
+			return Some(DBValue::from_slice(&NULL_RLP));
 		}
 		self.0.get(key)
 	}
 
 	fn contains(&self, key: &H256) -> bool {
-		if key == &SHA3_NULL_RLP {
+		if key == &KECCAK_NULL_RLP {
 			return true;
 		}
 		self.0.contains(key)
@@ -268,20 +259,20 @@ impl<'db> HashDB for WrappingMut<'db>{
 
 	fn insert(&mut self, value: &[u8]) -> H256 {
 		if value == &NULL_RLP {
-			return SHA3_NULL_RLP.clone();
+			return KECCAK_NULL_RLP.clone();
 		}
 		self.0.insert(value)
 	}
 
 	fn emplace(&mut self, key: H256, value: DBValue) {
-		if key == SHA3_NULL_RLP {
+		if key == KECCAK_NULL_RLP {
 			return;
 		}
 		self.0.emplace(key, value)
 	}
 
 	fn remove(&mut self, key: &H256) {
-		if key == &SHA3_NULL_RLP {
+		if key == &KECCAK_NULL_RLP {
 			return;
 		}
 		self.0.remove(key)

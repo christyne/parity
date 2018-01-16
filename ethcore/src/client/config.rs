@@ -1,4 +1,4 @@
-// Copyright 2015, 2016 Ethcore (UK) Ltd.
+// Copyright 2015-2017 Parity Technologies (UK) Ltd.
 // This file is part of Parity.
 
 // Parity is free software: you can redistribute it and/or modify
@@ -17,16 +17,19 @@
 use std::str::FromStr;
 use std::path::Path;
 use std::fmt::{Display, Formatter, Error as FmtError};
+
+use mode::Mode as IpcMode;
+use verification::{VerifierType, QueueConfig};
+use journaldb;
+use kvdb_rocksdb::CompactionProfile;
+
 pub use std::time::Duration;
 pub use blockchain::Config as BlockChainConfig;
 pub use trace::Config as TraceConfig;
 pub use evm::VMType;
 
-use verification::{VerifierType, QueueConfig};
-use util::{journaldb, CompactionProfile};
-
 /// Client state db compaction profile
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Clone)]
 pub enum DatabaseCompactionProfile {
 	/// Try to determine compaction profile automatically
 	Auto,
@@ -98,6 +101,29 @@ impl Display for Mode {
 	}
 }
 
+impl Into<IpcMode> for Mode {
+	fn into(self) -> IpcMode {
+		match self {
+			Mode::Off => IpcMode::Off,
+			Mode::Dark(timeout) => IpcMode::Dark(timeout.as_secs()),
+			Mode::Passive(timeout, alarm) => IpcMode::Passive(timeout.as_secs(), alarm.as_secs()),
+			Mode::Active => IpcMode::Active,
+		}
+	}
+}
+
+impl From<IpcMode> for Mode {
+	fn from(mode: IpcMode) -> Self {
+		match mode {
+			IpcMode::Off => Mode::Off,
+			IpcMode::Dark(timeout) => Mode::Dark(Duration::from_secs(timeout)),
+			IpcMode::Passive(timeout, alarm) => Mode::Passive(Duration::from_secs(timeout), Duration::from_secs(alarm)),
+			IpcMode::Active => Mode::Active,
+		}
+	}
+}
+
+
 /// Client configuration. Includes configs for all sub-systems.
 #[derive(Debug, PartialEq, Default)]
 pub struct ClientConfig {
@@ -115,7 +141,7 @@ pub struct ClientConfig {
 	pub pruning: journaldb::Algorithm,
 	/// The name of the client instance.
 	pub name: String,
-	/// RocksDB state column cache-size if not default
+	/// RocksDB column cache-size if not default
 	pub db_cache_size: Option<usize>,
 	/// State db compaction profile
 	pub db_compaction: DatabaseCompactionProfile,
@@ -123,14 +149,18 @@ pub struct ClientConfig {
 	pub db_wal: bool,
 	/// Operating mode
 	pub mode: Mode,
+	/// The chain spec name
+	pub spec_name: String,
 	/// Type of block verifier used by client.
 	pub verifier_type: VerifierType,
 	/// State db cache-size.
 	pub state_cache_size: usize,
 	/// EVM jump-tables cache size.
 	pub jump_table_size: usize,
-	/// State pruning history size.
+	/// Minimum state pruning history size.
 	pub history: u64,
+	/// Ideal memory usage for state pruning history.
+	pub history_mem: usize,
 	/// Check seal valididity on block import
 	pub check_seal: bool,
 }

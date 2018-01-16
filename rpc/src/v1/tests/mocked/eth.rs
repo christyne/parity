@@ -1,4 +1,4 @@
-// Copyright 2015, 2016 Ethcore (UK) Ltd.
+// Copyright 2015-2017 Parity Technologies (UK) Ltd.
 // This file is part of Parity.
 
 // Parity is free software: you can redistribute it and/or modify
@@ -18,22 +18,29 @@ use std::str::FromStr;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Instant, Duration};
-use rustc_serialize::hex::ToHex;
-use time::get_time;
-use rlp;
 
-use util::{Uint, U256, Address, H256, FixedHash, Mutex};
+use ethereum_types::{H256, U256, Address};
+use parking_lot::Mutex;
 use ethcore::account_provider::AccountProvider;
-use ethcore::client::{TestBlockChainClient, EachBlockWith, Executed, TransactionID};
+use ethcore::client::{TestBlockChainClient, EachBlockWith, Executed, TransactionId};
 use ethcore::log_entry::{LocalizedLogEntry, LogEntry};
-use ethcore::receipt::LocalizedReceipt;
-use ethcore::transaction::{Transaction, Action};
-use ethcore::miner::{ExternalMiner, MinerService};
+use ethcore::miner::MinerService;
+use ethcore::receipt::{LocalizedReceipt, TransactionOutcome};
+use ethkey::Secret;
 use ethsync::SyncState;
+use miner::external::ExternalMiner;
+use rlp;
+use rustc_hex::{FromHex, ToHex};
+use time::get_time;
+use transaction::{Transaction, Action};
 
 use jsonrpc_core::IoHandler;
 use v1::{Eth, EthClient, EthClientOptions, EthFilter, EthFilterClient, EthSigning, SigningUnsafeClient};
+use v1::helpers::nonce;
+use v1::helpers::dispatch::FullDispatcher;
 use v1::tests::helpers::{TestSyncProvider, Config, TestMinerService, TestSnapshotService};
+use v1::metadata::Metadata;
+use v1::types::Origin;
 
 fn blockchain_client() -> Arc<TestBlockChainClient> {
 	let client = TestBlockChainClient::new();
@@ -66,7 +73,7 @@ struct EthTester {
 	pub miner: Arc<TestMinerService>,
 	pub snapshot: Arc<TestSnapshotService>,
 	hashrates: Arc<Mutex<HashMap<H256, (Instant, U256)>>>,
-	pub io: IoHandler,
+	pub io: IoHandler<Metadata>,
 }
 
 impl Default for EthTester {
@@ -80,17 +87,22 @@ impl EthTester {
 		let client = blockchain_client();
 		let sync = sync_provider();
 		let ap = accounts_provider();
+		let opt_ap = Some(ap.clone());
 		let miner = miner_service();
 		let snapshot = snapshot_service();
 		let hashrates = Arc::new(Mutex::new(HashMap::new()));
 		let external_miner = Arc::new(ExternalMiner::new(hashrates.clone()));
-		let eth = EthClient::new(&client, &snapshot, &sync, &ap, &miner, &external_miner, options).to_delegate();
-		let filter = EthFilterClient::new(&client, &miner).to_delegate();
-		let sign = SigningUnsafeClient::new(&client, &ap, &miner).to_delegate();
-		let io = IoHandler::new();
-		io.add_delegate(eth);
-		io.add_delegate(sign);
-		io.add_delegate(filter);
+		let gas_price_percentile = options.gas_price_percentile;
+		let eth = EthClient::new(&client, &snapshot, &sync, &opt_ap, &miner, &external_miner, options).to_delegate();
+		let filter = EthFilterClient::new(client.clone(), miner.clone()).to_delegate();
+		let reservations = Arc::new(Mutex::new(nonce::Reservations::new()));
+
+		let dispatcher = FullDispatcher::new(client.clone(), miner.clone(), reservations, gas_price_percentile);
+		let sign = SigningUnsafeClient::new(&opt_ap, dispatcher).to_delegate();
+		let mut io: IoHandler<Metadata> = IoHandler::default();
+		io.extend_with(eth);
+		io.extend_with(sign);
+		io.extend_with(filter);
 
 		EthTester {
 			client: client,
@@ -137,16 +149,15 @@ fn rpc_eth_syncing() {
 	// "sync" to 1000 blocks.
 	// causes TestBlockChainClient to return 1000 for its best block number.
 	tester.add_blocks(1000, EachBlockWith::Nothing);
-	*tester.client.ancient_block.write() = Some((H256::new(), 5));
-	*tester.client.first_block.write() = Some((H256::from(U256::from(1234)), 3333));
 
-	let true_res = r#"{"jsonrpc":"2.0","result":{"blockGap":["0x6","0xd05"],"currentBlock":"0x3e8","highestBlock":"0x9c4","startingBlock":"0x0","warpChunksAmount":null,"warpChunksProcessed":null},"id":1}"#;
+
+	let true_res = r#"{"jsonrpc":"2.0","result":{"currentBlock":"0x3e8","highestBlock":"0x9c4","startingBlock":"0x0","warpChunksAmount":null,"warpChunksProcessed":null},"id":1}"#;
 	assert_eq!(tester.io.handle_request_sync(request), Some(true_res.to_owned()));
 
 	*tester.client.ancient_block.write() = None;
 	*tester.client.first_block.write() = None;
 
-	let snap_res = r#"{"jsonrpc":"2.0","result":{"blockGap":null,"currentBlock":"0x3e8","highestBlock":"0x9c4","startingBlock":"0x0","warpChunksAmount":"0x32","warpChunksProcessed":"0x18"},"id":1}"#;
+	let snap_res = r#"{"jsonrpc":"2.0","result":{"currentBlock":"0x3e8","highestBlock":"0x9c4","startingBlock":"0x0","warpChunksAmount":"0x32","warpChunksProcessed":"0x18"},"id":1}"#;
 	tester.snapshot.set_status(RestorationStatus::Ongoing {
 		state_chunks: 40,
 		block_chunks: 10,
@@ -194,6 +205,7 @@ fn rpc_eth_logs() {
 			data: vec![1,2,3],
 		},
 		transaction_index: 0,
+		transaction_log_index: 0,
 		transaction_hash: H256::default(),
 		log_index: 0,
 	}, LocalizedLogEntry {
@@ -205,8 +217,9 @@ fn rpc_eth_logs() {
 			data: vec![1,2,3],
 		},
 		transaction_index: 0,
+		transaction_log_index: 1,
 		transaction_hash: H256::default(),
-		log_index: 0,
+		log_index: 1,
 	}]);
 
 
@@ -214,8 +227,8 @@ fn rpc_eth_logs() {
 	let request2 = r#"{"jsonrpc": "2.0", "method": "eth_getLogs", "params": [{"limit":1}], "id": 1}"#;
 	let request3 = r#"{"jsonrpc": "2.0", "method": "eth_getLogs", "params": [{"limit":0}], "id": 1}"#;
 
-	let response1 = r#"{"jsonrpc":"2.0","result":[{"address":"0x0000000000000000000000000000000000000000","blockHash":"0x0000000000000000000000000000000000000000000000000000000000000000","blockNumber":"0x1","data":"0x010203","logIndex":"0x0","topics":[],"transactionHash":"0x0000000000000000000000000000000000000000000000000000000000000000","transactionIndex":"0x0","type":"mined"},{"address":"0x0000000000000000000000000000000000000000","blockHash":"0x0000000000000000000000000000000000000000000000000000000000000000","blockNumber":"0x1","data":"0x010203","logIndex":"0x0","topics":[],"transactionHash":"0x0000000000000000000000000000000000000000000000000000000000000000","transactionIndex":"0x0","type":"mined"}],"id":1}"#;
-	let response2 = r#"{"jsonrpc":"2.0","result":[{"address":"0x0000000000000000000000000000000000000000","blockHash":"0x0000000000000000000000000000000000000000000000000000000000000000","blockNumber":"0x1","data":"0x010203","logIndex":"0x0","topics":[],"transactionHash":"0x0000000000000000000000000000000000000000000000000000000000000000","transactionIndex":"0x0","type":"mined"}],"id":1}"#;
+	let response1 = r#"{"jsonrpc":"2.0","result":[{"address":"0x0000000000000000000000000000000000000000","blockHash":"0x0000000000000000000000000000000000000000000000000000000000000000","blockNumber":"0x1","data":"0x010203","logIndex":"0x0","topics":[],"transactionHash":"0x0000000000000000000000000000000000000000000000000000000000000000","transactionIndex":"0x0","transactionLogIndex":"0x0","type":"mined"},{"address":"0x0000000000000000000000000000000000000000","blockHash":"0x0000000000000000000000000000000000000000000000000000000000000000","blockNumber":"0x1","data":"0x010203","logIndex":"0x1","topics":[],"transactionHash":"0x0000000000000000000000000000000000000000000000000000000000000000","transactionIndex":"0x0","transactionLogIndex":"0x1","type":"mined"}],"id":1}"#;
+	let response2 = r#"{"jsonrpc":"2.0","result":[{"address":"0x0000000000000000000000000000000000000000","blockHash":"0x0000000000000000000000000000000000000000000000000000000000000000","blockNumber":"0x1","data":"0x010203","logIndex":"0x1","topics":[],"transactionHash":"0x0000000000000000000000000000000000000000000000000000000000000000","transactionIndex":"0x0","transactionLogIndex":"0x1","type":"mined"}],"id":1}"#;
 	let response3 = r#"{"jsonrpc":"2.0","result":[],"id":1}"#;
 
 	assert_eq!(tester.io.handle_request_sync(request1), Some(response1.to_owned()));
@@ -236,6 +249,7 @@ fn rpc_logs_filter() {
 			data: vec![1,2,3],
 		},
 		transaction_index: 0,
+		transaction_log_index: 0,
 		transaction_hash: H256::default(),
 		log_index: 0,
 	}, LocalizedLogEntry {
@@ -247,8 +261,9 @@ fn rpc_logs_filter() {
 			data: vec![1,2,3],
 		},
 		transaction_index: 0,
+		transaction_log_index: 1,
 		transaction_hash: H256::default(),
-		log_index: 0,
+		log_index: 1,
 	}]);
 
 	// Register filters first
@@ -262,8 +277,8 @@ fn rpc_logs_filter() {
 
 	let request_changes1 = r#"{"jsonrpc": "2.0", "method": "eth_getFilterChanges", "params": ["0x0"], "id": 1}"#;
 	let request_changes2 = r#"{"jsonrpc": "2.0", "method": "eth_getFilterChanges", "params": ["0x1"], "id": 1}"#;
-	let response1 = r#"{"jsonrpc":"2.0","result":[{"address":"0x0000000000000000000000000000000000000000","blockHash":"0x0000000000000000000000000000000000000000000000000000000000000000","blockNumber":"0x1","data":"0x010203","logIndex":"0x0","topics":[],"transactionHash":"0x0000000000000000000000000000000000000000000000000000000000000000","transactionIndex":"0x0","type":"mined"},{"address":"0x0000000000000000000000000000000000000000","blockHash":"0x0000000000000000000000000000000000000000000000000000000000000000","blockNumber":"0x1","data":"0x010203","logIndex":"0x0","topics":[],"transactionHash":"0x0000000000000000000000000000000000000000000000000000000000000000","transactionIndex":"0x0","type":"mined"}],"id":1}"#;
-	let response2 = r#"{"jsonrpc":"2.0","result":[{"address":"0x0000000000000000000000000000000000000000","blockHash":"0x0000000000000000000000000000000000000000000000000000000000000000","blockNumber":"0x1","data":"0x010203","logIndex":"0x0","topics":[],"transactionHash":"0x0000000000000000000000000000000000000000000000000000000000000000","transactionIndex":"0x0","type":"mined"}],"id":1}"#;
+	let response1 = r#"{"jsonrpc":"2.0","result":[{"address":"0x0000000000000000000000000000000000000000","blockHash":"0x0000000000000000000000000000000000000000000000000000000000000000","blockNumber":"0x1","data":"0x010203","logIndex":"0x0","topics":[],"transactionHash":"0x0000000000000000000000000000000000000000000000000000000000000000","transactionIndex":"0x0","transactionLogIndex":"0x0","type":"mined"},{"address":"0x0000000000000000000000000000000000000000","blockHash":"0x0000000000000000000000000000000000000000000000000000000000000000","blockNumber":"0x1","data":"0x010203","logIndex":"0x1","topics":[],"transactionHash":"0x0000000000000000000000000000000000000000000000000000000000000000","transactionIndex":"0x0","transactionLogIndex":"0x1","type":"mined"}],"id":1}"#;
+	let response2 = r#"{"jsonrpc":"2.0","result":[{"address":"0x0000000000000000000000000000000000000000","blockHash":"0x0000000000000000000000000000000000000000000000000000000000000000","blockNumber":"0x1","data":"0x010203","logIndex":"0x1","topics":[],"transactionHash":"0x0000000000000000000000000000000000000000000000000000000000000000","transactionIndex":"0x0","transactionLogIndex":"0x1","type":"mined"}],"id":1}"#;
 
 	assert_eq!(tester.io.handle_request_sync(request_changes1), Some(response1.to_owned()));
 	assert_eq!(tester.io.handle_request_sync(request_changes2), Some(response2.to_owned()));
@@ -292,10 +307,9 @@ fn rpc_eth_submit_hashrate() {
 fn rpc_eth_sign() {
 	let tester = EthTester::default();
 
-	let account = tester.accounts_provider.new_account("abcd").unwrap();
+	let account = tester.accounts_provider.insert_account(Secret::from_slice(&[69u8; 32]), "abcd").unwrap();
 	tester.accounts_provider.unlock_account_permanently(account, "abcd".into()).unwrap();
-	let message = H256::from("0x0cc175b9c0f1b6a831c399e26977266192eb5ffee6ae2fec3ad71c777531578f");
-	let signed = tester.accounts_provider.sign(account, None, message).unwrap();
+	let _message = "0cc175b9c0f1b6a831c399e26977266192eb5ffee6ae2fec3ad71c777531578f".from_hex().unwrap();
 
 	let req = r#"{
 		"jsonrpc": "2.0",
@@ -306,9 +320,9 @@ fn rpc_eth_sign() {
 		],
 		"id": 1
 	}"#;
-	let res = r#"{"jsonrpc":"2.0","result":""#.to_owned() + &format!("0x{}", signed) + r#"","id":1}"#;
+	let res = r#"{"jsonrpc":"2.0","result":"0xa2870db1d0c26ef93c7b72d2a0830fa6b841e0593f7186bc6c7cc317af8cf3a42fda03bd589a49949aa05db83300cdb553116274518dbe9d90c65d0213f4af491b","id":1}"#;
 
-	assert_eq!(tester.io.handle_request_sync(&req), Some(res));
+	assert_eq!(tester.io.handle_request_sync(&req), Some(res.into()));
 }
 
 #[test]
@@ -323,7 +337,12 @@ fn rpc_eth_author() {
 		"id": 1
 	}"#;
 
+	// No accounts - returns zero
 	assert_eq!(tester.io.handle_request_sync(req), Some(make_res(Address::zero())));
+
+	// Account set - return first account
+	let addr = tester.accounts_provider.new_account("123").unwrap();
+	assert_eq!(tester.io.handle_request_sync(req), Some(make_res(addr)));
 
 	for i in 0..20 {
 		let addr = tester.accounts_provider.new_account(&format!("{}", i)).unwrap();
@@ -355,18 +374,28 @@ fn rpc_eth_gas_price() {
 fn rpc_eth_accounts() {
 	let tester = EthTester::default();
 	let address = tester.accounts_provider.new_account("").unwrap();
-	let address2 = Address::default();
+	tester.accounts_provider.set_new_dapps_addresses(None).unwrap();
+	tester.accounts_provider.set_address_name(1.into(), "1".into());
+	tester.accounts_provider.set_address_name(10.into(), "10".into());
 
-	tester.accounts_provider.set_address_name(address2, "Test Account".into()).unwrap();
-
+	// with current policy it should return the account
 	let request = r#"{"jsonrpc": "2.0", "method": "eth_accounts", "params": [], "id": 1}"#;
-	let response = r#"{"jsonrpc":"2.0","result":[""#.to_owned()
-		+ &format!("0x{:?}", address2)
-		+ r#"",""#
-		+ &format!("0x{:?}", address)
-		+ r#""],"id":1}"#;
-
+	let response = r#"{"jsonrpc":"2.0","result":[""#.to_owned() + &format!("0x{:?}", address) + r#""],"id":1}"#;
 	assert_eq!(tester.io.handle_request_sync(request), Some(response.to_owned()));
+
+	tester.accounts_provider.set_new_dapps_addresses(Some(vec![1.into()])).unwrap();
+	// even with some account it should return empty list (no dapp detected)
+	let request = r#"{"jsonrpc": "2.0", "method": "eth_accounts", "params": [], "id": 1}"#;
+	let response = r#"{"jsonrpc":"2.0","result":["0x0000000000000000000000000000000000000001"],"id":1}"#;
+	assert_eq!(tester.io.handle_request_sync(request), Some(response.to_owned()));
+
+	// when we add visible address it should return that.
+	tester.accounts_provider.set_dapp_addresses("app1".into(), Some(vec![10.into()])).unwrap();
+	let request = r#"{"jsonrpc": "2.0", "method": "eth_accounts", "params": [], "id": 1}"#;
+	let response = r#"{"jsonrpc":"2.0","result":["0x000000000000000000000000000000000000000a"],"id":1}"#;
+	let mut meta = Metadata::default();
+	meta.origin = Origin::Dapps("app1".into());
+	assert_eq!((*tester.io).handle_request_sync(request, meta), Some(response.to_owned()));
 }
 
 #[test]
@@ -408,10 +437,7 @@ fn rpc_eth_balance_pending() {
 		"id": 1
 	}"#;
 
-	// the TestMinerService doesn't communicate with the the TestBlockChainClient in any way.
-	// if this returns zero, we know that the "pending" call is being properly forwarded to the
-	// miner.
-	let response = r#"{"jsonrpc":"2.0","result":"0x0","id":1}"#;
+	let response = r#"{"jsonrpc":"2.0","result":"0x5","id":1}"#;
 
 	assert_eq!(tester.io.handle_request_sync(request), Some(response.to_owned()));
 }
@@ -443,6 +469,32 @@ fn rpc_eth_transaction_count() {
 	let response = r#"{"jsonrpc":"2.0","result":"0x0","id":1}"#;
 
 	assert_eq!(EthTester::default().io.handle_request_sync(request), Some(response.to_owned()));
+}
+
+#[test]
+fn rpc_eth_transaction_count_next_nonce() {
+	let tester = EthTester::new_with_options(EthClientOptions::with(|options| {
+		options.pending_nonce_from_queue = true;
+	}));
+	tester.miner.increment_last_nonce(1.into());
+
+	let request1 = r#"{
+		"jsonrpc": "2.0",
+		"method": "eth_getTransactionCount",
+		"params": ["0x0000000000000000000000000000000000000001", "pending"],
+		"id": 1
+	}"#;
+	let response1 = r#"{"jsonrpc":"2.0","result":"0x1","id":1}"#;
+	assert_eq!(tester.io.handle_request_sync(request1), Some(response1.to_owned()));
+
+	let request2 = r#"{
+		"jsonrpc": "2.0",
+		"method": "eth_getTransactionCount",
+		"params": ["0x0000000000000000000000000000000000000002", "pending"],
+		"id": 1
+	}"#;
+	let response2 = r#"{"jsonrpc":"2.0","result":"0x0","id":1}"#;
+	assert_eq!(tester.io.handle_request_sync(request2), Some(response2.to_owned()));
 }
 
 #[test]
@@ -486,16 +538,18 @@ fn rpc_eth_transaction_count_by_number_pending() {
 
 #[test]
 fn rpc_eth_pending_transaction_by_hash() {
-	use util::*;
-	use ethcore::transaction::*;
+	use ethereum_types::H256;
+	use rlp;
+	use transaction::SignedTransaction;
 
 	let tester = EthTester::default();
 	{
-		let tx: SignedTransaction = ::rlp::decode(&FromHex::from_hex("f85f800182520894095e7baea6a6c7c4c2dfeb977efac326af552d870a801ba048b55bfa915ac795c431978d8a6a992b628d557da5ff759b307d495a36649353a0efffd310ac743f371de3b9f7f9cb56c0b28ad43601b4ab949f53faa07bd2c804").unwrap());
+		let tx = rlp::decode(&FromHex::from_hex("f85f800182520894095e7baea6a6c7c4c2dfeb977efac326af552d870a801ba048b55bfa915ac795c431978d8a6a992b628d557da5ff759b307d495a36649353a0efffd310ac743f371de3b9f7f9cb56c0b28ad43601b4ab949f53faa07bd2c804").unwrap());
+		let tx = SignedTransaction::new(tx).unwrap();
 		tester.miner.pending_transactions.lock().insert(H256::zero(), tx);
 	}
 
-	let response = r#"{"jsonrpc":"2.0","result":{"blockHash":null,"blockNumber":null,"creates":null,"from":"0x0f65fe9276bc9a24ae7083ae28e2660ef72df99e","gas":"0x5208","gasPrice":"0x1","hash":"0x41df922fd0d4766fcc02e161f8295ec28522f329ae487f14d811e4b64c8d6e31","input":"0x","nonce":"0x0","publicKey":"0x7ae46da747962c2ee46825839c1ef9298e3bd2e70ca2938495c3693a485ec3eaa8f196327881090ff64cf4fbb0a48485d4f83098e189ed3b7a87d5941b59f789","r":"0x48b55bfa915ac795c431978d8a6a992b628d557da5ff759b307d495a36649353","raw":"0xf85f800182520894095e7baea6a6c7c4c2dfeb977efac326af552d870a801ba048b55bfa915ac795c431978d8a6a992b628d557da5ff759b307d495a36649353a0efffd310ac743f371de3b9f7f9cb56c0b28ad43601b4ab949f53faa07bd2c804","s":"0xefffd310ac743f371de3b9f7f9cb56c0b28ad43601b4ab949f53faa07bd2c804","to":"0x095e7baea6a6c7c4c2dfeb977efac326af552d87","transactionIndex":null,"v":0,"value":"0xa"},"id":1}"#;
+	let response = r#"{"jsonrpc":"2.0","result":{"blockHash":null,"blockNumber":null,"chainId":null,"condition":null,"creates":null,"from":"0x0f65fe9276bc9a24ae7083ae28e2660ef72df99e","gas":"0x5208","gasPrice":"0x1","hash":"0x41df922fd0d4766fcc02e161f8295ec28522f329ae487f14d811e4b64c8d6e31","input":"0x","nonce":"0x0","publicKey":"0x7ae46da747962c2ee46825839c1ef9298e3bd2e70ca2938495c3693a485ec3eaa8f196327881090ff64cf4fbb0a48485d4f83098e189ed3b7a87d5941b59f789","r":"0x48b55bfa915ac795c431978d8a6a992b628d557da5ff759b307d495a36649353","raw":"0xf85f800182520894095e7baea6a6c7c4c2dfeb977efac326af552d870a801ba048b55bfa915ac795c431978d8a6a992b628d557da5ff759b307d495a36649353a0efffd310ac743f371de3b9f7f9cb56c0b28ad43601b4ab949f53faa07bd2c804","s":"0xefffd310ac743f371de3b9f7f9cb56c0b28ad43601b4ab949f53faa07bd2c804","standardV":"0x0","to":"0x095e7baea6a6c7c4c2dfeb977efac326af552d87","transactionIndex":null,"v":"0x1b","value":"0xa"},"id":1}"#;
 	let request = r#"{
 		"jsonrpc": "2.0",
 		"method": "eth_getTransactionByHash",
@@ -552,6 +606,7 @@ fn rpc_eth_code() {
 fn rpc_eth_call_latest() {
 	let tester = EthTester::default();
 	tester.client.set_execution_result(Ok(Executed {
+		exception: None,
 		gas: U256::zero(),
 		gas_used: U256::from(0xff30),
 		refunded: U256::from(0x5),
@@ -587,6 +642,7 @@ fn rpc_eth_call_latest() {
 fn rpc_eth_call() {
 	let tester = EthTester::default();
 	tester.client.set_execution_result(Ok(Executed {
+		exception: None,
 		gas: U256::zero(),
 		gas_used: U256::from(0xff30),
 		refunded: U256::from(0x5),
@@ -622,6 +678,7 @@ fn rpc_eth_call() {
 fn rpc_eth_call_default_block() {
 	let tester = EthTester::default();
 	tester.client.set_execution_result(Ok(Executed {
+		exception: None,
 		gas: U256::zero(),
 		gas_used: U256::from(0xff30),
 		refunded: U256::from(0x5),
@@ -656,6 +713,7 @@ fn rpc_eth_call_default_block() {
 fn rpc_eth_estimate_gas() {
 	let tester = EthTester::default();
 	tester.client.set_execution_result(Ok(Executed {
+		exception: None,
 		gas: U256::zero(),
 		gas_used: U256::from(0xff30),
 		refunded: U256::from(0x5),
@@ -682,7 +740,7 @@ fn rpc_eth_estimate_gas() {
 		"latest"],
 		"id": 1
 	}"#;
-	let response = r#"{"jsonrpc":"2.0","result":"0xff35","id":1}"#;
+	let response = r#"{"jsonrpc":"2.0","result":"0x5208","id":1}"#;
 
 	assert_eq!(tester.io.handle_request_sync(request), Some(response.to_owned()));
 }
@@ -691,6 +749,7 @@ fn rpc_eth_estimate_gas() {
 fn rpc_eth_estimate_gas_default_block() {
 	let tester = EthTester::default();
 	tester.client.set_execution_result(Ok(Executed {
+		exception: None,
 		gas: U256::zero(),
 		gas_used: U256::from(0xff30),
 		refunded: U256::from(0x5),
@@ -716,7 +775,7 @@ fn rpc_eth_estimate_gas_default_block() {
 		}],
 		"id": 1
 	}"#;
-	let response = r#"{"jsonrpc":"2.0","result":"0xff35","id":1}"#;
+	let response = r#"{"jsonrpc":"2.0","result":"0x5208","id":1}"#;
 
 	assert_eq!(tester.io.handle_request_sync(request), Some(response.to_owned()));
 }
@@ -806,17 +865,21 @@ fn rpc_eth_sign_transaction() {
 	let response = r#"{"jsonrpc":"2.0","result":{"#.to_owned() +
 		r#""raw":"0x"# + &rlp.to_hex() + r#"","# +
 		r#""tx":{"# +
-		r#""blockHash":null,"blockNumber":null,"creates":null,"# +
+		r#""blockHash":null,"blockNumber":null,"# +
+		&format!("\"chainId\":{},", t.chain_id().map_or("null".to_owned(), |n| format!("{}", n))) +
+		r#""condition":null,"creates":null,"# +
 		&format!("\"from\":\"0x{:?}\",", &address) +
 		r#""gas":"0x76c0","gasPrice":"0x9184e72a000","# +
 		&format!("\"hash\":\"0x{:?}\",", t.hash()) +
-		r#""input":"0x","nonce":"0x1","# +
-		&format!("\"publicKey\":\"0x{:?}\",", t.public_key().unwrap()) +
-		&format!("\"r\":\"0x{}\",", signature.r().to_hex()) +
+		r#""input":"0x","# +
+		r#""nonce":"0x1","# +
+		&format!("\"publicKey\":\"0x{:?}\",", t.recover_public().unwrap()) +
+		&format!("\"r\":\"0x{}\",", U256::from(signature.r()).to_hex()) +
 		&format!("\"raw\":\"0x{}\",", rlp.to_hex()) +
-		&format!("\"s\":\"0x{}\",", signature.s().to_hex()) +
+		&format!("\"s\":\"0x{}\",", U256::from(signature.s()).to_hex()) +
+		&format!("\"standardV\":\"0x{}\",", U256::from(t.standard_v()).to_hex()) +
 		r#""to":"0xd46e8dd67c5d32be8058bb8eb970870f07244567","transactionIndex":null,"# +
-		&format!("\"v\":{},", signature.v()) +
+		&format!("\"v\":\"0x{}\",", U256::from(t.original_v()).to_hex()) +
 		r#""value":"0x9184e72a""# +
 		r#"}},"id":1}"#;
 
@@ -842,7 +905,7 @@ fn rpc_eth_send_transaction_with_bad_to() {
 		"id": 1
 	}"#;
 
-	let response = r#"{"jsonrpc":"2.0","error":{"code":-32602,"message":"Invalid params","data":null},"id":1}"#;
+	let response = r#"{"jsonrpc":"2.0","error":{"code":-32602,"message":"Invalid params: expected a hex-encoded hash with 0x prefix."},"id":1}"#;
 
 	assert_eq!(tester.io.handle_request_sync(&request), Some(response.into()));
 }
@@ -881,7 +944,7 @@ fn rpc_eth_send_raw_transaction_error() {
 		],
 		"id": 1
 	}"#;
-	let res = r#"{"jsonrpc":"2.0","error":{"code":-32602,"message":"Invalid RLP.","data":"RlpIncorrectListLen"},"id":1}"#.into();
+	let res = r#"{"jsonrpc":"2.0","error":{"code":-32602,"message":"Invalid RLP.","data":"RlpExpectedToBeList"},"id":1}"#.into();
 
 	assert_eq!(tester.io.handle_request_sync(&req), Some(res));
 }
@@ -903,7 +966,7 @@ fn rpc_eth_send_raw_transaction() {
 	let signature = tester.accounts_provider.sign(address, None, t.hash(None)).unwrap();
 	let t = t.with_signature(signature, None);
 
-	let rlp = rlp::encode(&t).to_vec().to_hex();
+	let rlp = rlp::encode(&t).into_vec().to_hex();
 
 	let req = r#"{
 		"jsonrpc": "2.0",
@@ -942,15 +1005,16 @@ fn rpc_eth_transaction_receipt() {
 			block_number: 0x4510c,
 			transaction_hash: H256::new(),
 			transaction_index: 0,
+			transaction_log_index: 0,
 			log_index: 1,
 		}],
 		log_bloom: 0.into(),
-		state_root: 0.into(),
+		outcome: TransactionOutcome::StateRoot(0.into()),
 	};
 
 	let hash = H256::from_str("b903239f8543d04b5dc1ba6579132b143087c68db1b2168786408fcbce568238").unwrap();
 	let tester = EthTester::default();
-	tester.client.set_transaction_receipt(TransactionID::Hash(hash), receipt);
+	tester.client.set_transaction_receipt(TransactionId::Hash(hash), receipt);
 
 	let request = r#"{
 		"jsonrpc": "2.0",
@@ -958,7 +1022,7 @@ fn rpc_eth_transaction_receipt() {
 		"params": ["0xb903239f8543d04b5dc1ba6579132b143087c68db1b2168786408fcbce568238"],
 		"id": 1
 	}"#;
-	let response = r#"{"jsonrpc":"2.0","result":{"blockHash":"0xed76641c68a1c641aee09a94b3b471f4dc0316efe5ac19cf488e2674cf8d05b5","blockNumber":"0x4510c","contractAddress":null,"cumulativeGasUsed":"0x20","gasUsed":"0x10","logs":[{"address":"0x33990122638b9132ca29c723bdf037f1a891a70c","blockHash":"0xed76641c68a1c641aee09a94b3b471f4dc0316efe5ac19cf488e2674cf8d05b5","blockNumber":"0x4510c","data":"0x","logIndex":"0x1","topics":["0xa6697e974e6a320f454390be03f74955e8978f1a6971ea6730542e37b66179bc","0x4861736852656700000000000000000000000000000000000000000000000000"],"transactionHash":"0x0000000000000000000000000000000000000000000000000000000000000000","transactionIndex":"0x0","type":"mined"}],"logsBloom":"0x00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000","root":"0x0000000000000000000000000000000000000000000000000000000000000000","transactionHash":"0x0000000000000000000000000000000000000000000000000000000000000000","transactionIndex":"0x0"},"id":1}"#;
+	let response = r#"{"jsonrpc":"2.0","result":{"blockHash":"0xed76641c68a1c641aee09a94b3b471f4dc0316efe5ac19cf488e2674cf8d05b5","blockNumber":"0x4510c","contractAddress":null,"cumulativeGasUsed":"0x20","gasUsed":"0x10","logs":[{"address":"0x33990122638b9132ca29c723bdf037f1a891a70c","blockHash":"0xed76641c68a1c641aee09a94b3b471f4dc0316efe5ac19cf488e2674cf8d05b5","blockNumber":"0x4510c","data":"0x","logIndex":"0x1","topics":["0xa6697e974e6a320f454390be03f74955e8978f1a6971ea6730542e37b66179bc","0x4861736852656700000000000000000000000000000000000000000000000000"],"transactionHash":"0x0000000000000000000000000000000000000000000000000000000000000000","transactionIndex":"0x0","transactionLogIndex":"0x0","type":"mined"}],"logsBloom":"0x00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000","root":"0x0000000000000000000000000000000000000000000000000000000000000000","status":null,"transactionHash":"0x0000000000000000000000000000000000000000000000000000000000000000","transactionIndex":"0x0"},"id":1}"#;
 
 	assert_eq!(tester.io.handle_request_sync(request), Some(response.to_owned()));
 }
@@ -986,7 +1050,7 @@ fn rpc_eth_transaction_receipt_null() {
 #[test]
 fn rpc_eth_compilers() {
 	let request = r#"{"jsonrpc": "2.0", "method": "eth_getCompilers", "params": [], "id": 1}"#;
-	let response = r#"{"jsonrpc":"2.0","result":[],"id":1}"#;
+	let response = r#"{"jsonrpc":"2.0","error":{"code":-32070,"message":"Method deprecated","data":"Compilation functionality is deprecated."},"id":1}"#;
 
 	assert_eq!(EthTester::default().io.handle_request_sync(request), Some(response.to_owned()));
 }
@@ -995,7 +1059,7 @@ fn rpc_eth_compilers() {
 #[test]
 fn rpc_eth_compile_lll() {
 	let request = r#"{"jsonrpc": "2.0", "method": "eth_compileLLL", "params": [], "id": 1}"#;
-	let response = r#"{"jsonrpc":"2.0","error":{"code":-32603,"message":"Internal error","data":null},"id":1}"#;
+	let response = r#"{"jsonrpc":"2.0","error":{"code":-32070,"message":"Method deprecated","data":"Compilation of LLL via RPC is deprecated"},"id":1}"#;
 
 	assert_eq!(EthTester::default().io.handle_request_sync(request), Some(response.to_owned()));
 }
@@ -1004,7 +1068,7 @@ fn rpc_eth_compile_lll() {
 #[test]
 fn rpc_eth_compile_solidity() {
 	let request = r#"{"jsonrpc": "2.0", "method": "eth_compileSolidity", "params": [], "id": 1}"#;
-	let response = r#"{"jsonrpc":"2.0","error":{"code":-32603,"message":"Internal error","data":null},"id":1}"#;
+	let response = r#"{"jsonrpc":"2.0","error":{"code":-32070,"message":"Method deprecated","data":"Compilation of Solidity via RPC is deprecated"},"id":1}"#;
 
 	assert_eq!(EthTester::default().io.handle_request_sync(request), Some(response.to_owned()));
 }
@@ -1013,7 +1077,7 @@ fn rpc_eth_compile_solidity() {
 #[test]
 fn rpc_eth_compile_serpent() {
 	let request = r#"{"jsonrpc": "2.0", "method": "eth_compileSerpent", "params": [], "id": 1}"#;
-	let response = r#"{"jsonrpc":"2.0","error":{"code":-32603,"message":"Internal error","data":null},"id":1}"#;
+	let response = r#"{"jsonrpc":"2.0","error":{"code":-32070,"message":"Method deprecated","data":"Compilation of Serpent via RPC is deprecated"},"id":1}"#;
 
 	assert_eq!(EthTester::default().io.handle_request_sync(request), Some(response.to_owned()));
 }
@@ -1024,7 +1088,7 @@ fn rpc_get_work_returns_no_work_if_cant_mine() {
 	eth_tester.client.set_queue_size(10);
 
 	let request = r#"{"jsonrpc": "2.0", "method": "eth_getWork", "params": [], "id": 1}"#;
-	let response = r#"{"jsonrpc":"2.0","error":{"code":-32001,"message":"Still syncing.","data":null},"id":1}"#;
+	let response = r#"{"jsonrpc":"2.0","error":{"code":-32001,"message":"Still syncing."},"id":1}"#;
 
 	assert_eq!(eth_tester.io.handle_request_sync(request), Some(response.to_owned()));
 }
@@ -1035,21 +1099,20 @@ fn rpc_get_work_returns_correct_work_package() {
 	eth_tester.miner.set_author(Address::from_str("d46e8dd67c5d32be8058bb8eb970870f07244567").unwrap());
 
 	let request = r#"{"jsonrpc": "2.0", "method": "eth_getWork", "params": [], "id": 1}"#;
-	let response = r#"{"jsonrpc":"2.0","result":["0x3bbe93f74e7b97ae00784aeff8819c5cb600dd87e8b282a5d3446f3f871f0347","0x0000000000000000000000000000000000000000000000000000000000000000","0x0000800000000000000000000000000000000000000000000000000000000000","0x1"],"id":1}"#;
+	let response = r#"{"jsonrpc":"2.0","result":["0x76c7bd86693aee93d1a80a408a09a0585b1a1292afcb56192f171d925ea18e2d","0x0000000000000000000000000000000000000000000000000000000000000000","0x0000800000000000000000000000000000000000000000000000000000000000","0x1"],"id":1}"#;
 
 	assert_eq!(eth_tester.io.handle_request_sync(request), Some(response.to_owned()));
 }
 
 #[test]
 fn rpc_get_work_should_not_return_block_number() {
-	let eth_tester = EthTester::new_with_options(EthClientOptions {
-		allow_pending_receipt_query: true,
-		send_block_number_in_get_work: false,
-	});
+	let eth_tester = EthTester::new_with_options(EthClientOptions::with(|options| {
+		options.send_block_number_in_get_work = false;
+	}));
 	eth_tester.miner.set_author(Address::from_str("d46e8dd67c5d32be8058bb8eb970870f07244567").unwrap());
 
 	let request = r#"{"jsonrpc": "2.0", "method": "eth_getWork", "params": [], "id": 1}"#;
-	let response = r#"{"jsonrpc":"2.0","result":["0x3bbe93f74e7b97ae00784aeff8819c5cb600dd87e8b282a5d3446f3f871f0347","0x0000000000000000000000000000000000000000000000000000000000000000","0x0000800000000000000000000000000000000000000000000000000000000000"],"id":1}"#;
+	let response = r#"{"jsonrpc":"2.0","result":["0x76c7bd86693aee93d1a80a408a09a0585b1a1292afcb56192f171d925ea18e2d","0x0000000000000000000000000000000000000000000000000000000000000000","0x0000800000000000000000000000000000000000000000000000000000000000"],"id":1}"#;
 
 	assert_eq!(eth_tester.io.handle_request_sync(request), Some(response.to_owned()));
 }
@@ -1070,7 +1133,7 @@ fn rpc_get_work_should_timeout() {
 	assert_eq!(eth_tester.io.handle_request_sync(request), Some(work_response.to_owned()));
 
 	// Request with timeout of 0 seconds. This should work since we're disabling timeout.
-	let request = r#"{"jsonrpc": "2.0", "method": "eth_getWork", "params": ["0"], "id": 1}"#;
+	let request = r#"{"jsonrpc": "2.0", "method": "eth_getWork", "params": [0], "id": 1}"#;
 	let work_response = format!(
 		r#"{{"jsonrpc":"2.0","result":["0x{:?}","0x0000000000000000000000000000000000000000000000000000000000000000","0x0000800000000000000000000000000000000000000000000000000000000000","0x1"],"id":1}}"#,
 		hash,
@@ -1078,11 +1141,11 @@ fn rpc_get_work_should_timeout() {
 	assert_eq!(eth_tester.io.handle_request_sync(request), Some(work_response.to_owned()));
 
 	// Request with timeout of 10K seconds. This should work.
-	let request = r#"{"jsonrpc": "2.0", "method": "eth_getWork", "params": ["10000"], "id": 1}"#;
+	let request = r#"{"jsonrpc": "2.0", "method": "eth_getWork", "params": [10000], "id": 1}"#;
 	assert_eq!(eth_tester.io.handle_request_sync(request), Some(work_response.to_owned()));
 
 	// Request with timeout of 10 seconds. This should fail.
-	let request = r#"{"jsonrpc": "2.0", "method": "eth_getWork", "params": ["10"], "id": 1}"#;
-	let err_response = r#"{"jsonrpc":"2.0","error":{"code":-32003,"message":"Work has not changed.","data":null},"id":1}"#;
+	let request = r#"{"jsonrpc": "2.0", "method": "eth_getWork", "params": [10], "id": 1}"#;
+	let err_response = r#"{"jsonrpc":"2.0","error":{"code":-32003,"message":"Work has not changed."},"id":1}"#;
 	assert_eq!(eth_tester.io.handle_request_sync(request), Some(err_response.to_owned()));
 }

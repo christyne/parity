@@ -1,4 +1,4 @@
-// Copyright 2015, 2016 Ethcore (UK) Ltd.
+// Copyright 2015-2017 Parity Technologies (UK) Ltd.
 // This file is part of Parity.
 
 // Parity is free software: you can redistribute it and/or modify
@@ -16,10 +16,10 @@
 
 //! Peer status and capabilities.
 
-use rlp::{DecoderError, RlpDecodable, RlpEncodable, RlpStream, Stream, UntrustedRlp, View};
-use util::{H256, U256};
+use rlp::{DecoderError, Encodable, Decodable, RlpStream, UntrustedRlp};
+use ethereum_types::{H256, U256};
 
-use super::buffer_flow::FlowParams;
+use super::request_credits::FlowParams;
 
 // recognized handshake/announcement keys.
 // unknown keys are to be skipped, known keys have a defined order.
@@ -82,26 +82,6 @@ impl Key {
 	}
 }
 
-/// Network ID structure.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(u32)]
-pub enum NetworkId {
-	/// ID for the mainnet
-	Mainnet = 1,
-	/// ID for the testnet
-	Testnet = 0,
-}
-
-impl NetworkId {
-	fn from_raw(raw: u32) -> Option<Self> {
-		match raw {
-			0 => Some(NetworkId::Testnet),
-			1 => Some(NetworkId::Mainnet),
-			_ => None,
-		}
-	}
-}
-
 // helper for decoding key-value pairs in the handshake or an announcement.
 struct Parser<'a> {
 	pos: usize,
@@ -111,15 +91,16 @@ struct Parser<'a> {
 impl<'a> Parser<'a> {
 	// expect a specific next key, and decode the value.
 	// error on unexpected key or invalid value.
-	fn expect<T: RlpDecodable>(&mut self, key: Key) -> Result<T, DecoderError> {
+	fn expect<T: Decodable>(&mut self, key: Key) -> Result<T, DecoderError> {
 		self.expect_raw(key).and_then(|item| item.as_val())
 	}
 
 	// expect a specific next key, and get the value's RLP.
 	// if the key isn't found, the position isn't advanced.
 	fn expect_raw(&mut self, key: Key) -> Result<UntrustedRlp<'a>, DecoderError> {
+		trace!(target: "les", "Expecting key {}", key.as_str());
 		let pre_pos = self.pos;
-		if let Some((k, val)) = try!(self.get_next()) {
+		if let Some((k, val)) = self.get_next()? {
 			if k == key { return Ok(val) }
 		}
 
@@ -129,13 +110,13 @@ impl<'a> Parser<'a> {
 
 	// get the next key and value RLP.
 	fn get_next(&mut self) -> Result<Option<(Key, UntrustedRlp<'a>)>, DecoderError> {
-		while self.pos < self.rlp.item_count() {
-			let pair = try!(self.rlp.at(self.pos));
-			let k: String = try!(pair.val_at(0));
+		while self.pos < self.rlp.item_count()? {
+			let pair = self.rlp.at(self.pos)?;
+			let k: String = pair.val_at(0)?;
 
 			self.pos += 1;
 			match Key::from_str(&k) {
-				Some(key) => return Ok(Some((key , try!(pair.at(1))))),
+				Some(key) => return Ok(Some((key , pair.at(1)?))),
 				None => continue,
 			}
 		}
@@ -145,7 +126,7 @@ impl<'a> Parser<'a> {
 }
 
 // Helper for encoding a key-value pair
-fn encode_pair<T: RlpEncodable>(key: Key, val: &T) -> Vec<u8> {
+fn encode_pair<T: Encodable>(key: Key, val: &T) -> Vec<u8> {
 	let mut s = RlpStream::new_list(2);
 	s.append(&key.as_str()).append(val);
 	s.out()
@@ -164,7 +145,7 @@ pub struct Status {
 	/// Protocol version.
 	pub protocol_version: u32,
 	/// Network id of this peer.
-	pub network_id: NetworkId,
+	pub network_id: u64,
 	/// Total difficulty of the head of the chain.
 	pub head_td: U256,
 	/// Hash of the best block.
@@ -177,14 +158,26 @@ pub struct Status {
 	pub last_head: Option<(H256, u64)>,
 }
 
+impl Status {
+	/// Update the status from an announcement.
+	pub fn update_from(&mut self, announcement: &Announcement) {
+		self.last_head = Some((self.head_hash, announcement.reorg_depth));
+		self.head_td = announcement.head_td;
+		self.head_hash = announcement.head_hash;
+		self.head_num = announcement.head_num;
+	}
+}
+
 /// Peer capabilities.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Capabilities {
 	/// Whether this peer can serve headers
 	pub serve_headers: bool,
 	/// Earliest block number it can serve block/receipt requests for.
+	/// `None` means no requests will be servable.
 	pub serve_chain_since: Option<u64>,
 	/// Earliest block number it can serve state requests for.
+	/// `None` means no requests will be servable.
 	pub serve_state_since: Option<u64>,
 	/// Whether it can relay transactions to the eth network.
 	pub tx_relay: bool,
@@ -201,24 +194,33 @@ impl Default for Capabilities {
 	}
 }
 
+impl Capabilities {
+	/// Update the capabilities from an announcement.
+	pub fn update_from(&mut self, announcement: &Announcement) {
+		self.serve_headers = self.serve_headers || announcement.serve_headers;
+		self.serve_state_since = self.serve_state_since.or(announcement.serve_state_since);
+		self.serve_chain_since = self.serve_chain_since.or(announcement.serve_chain_since);
+		self.tx_relay = self.tx_relay || announcement.tx_relay;
+	}
+}
+
 /// Attempt to parse a handshake message into its three parts:
 ///   - chain status
 ///   - serving capabilities
-///   - buffer flow parameters
-pub fn parse_handshake(rlp: UntrustedRlp) -> Result<(Status, Capabilities, FlowParams), DecoderError> {
+///   - request credit parameters
+pub fn parse_handshake(rlp: UntrustedRlp) -> Result<(Status, Capabilities, Option<FlowParams>), DecoderError> {
 	let mut parser = Parser {
 		pos: 0,
 		rlp: rlp,
 	};
 
 	let status = Status {
-		protocol_version: try!(parser.expect(Key::ProtocolVersion)),
-		network_id: try!(parser.expect(Key::NetworkId)
-			.and_then(|id: u32| NetworkId::from_raw(id).ok_or(DecoderError::Custom("Invalid network ID")))),
-		head_td: try!(parser.expect(Key::HeadTD)),
-		head_hash: try!(parser.expect(Key::HeadHash)),
-		head_num: try!(parser.expect(Key::HeadNum)),
-		genesis_hash: try!(parser.expect(Key::GenesisHash)),
+		protocol_version: parser.expect(Key::ProtocolVersion)?,
+		network_id: parser.expect(Key::NetworkId)?,
+		head_td: parser.expect(Key::HeadTD)?,
+		head_hash: parser.expect(Key::HeadHash)?,
+		head_num: parser.expect(Key::HeadNum)?,
+		genesis_hash: parser.expect(Key::GenesisHash)?,
 		last_head: None,
 	};
 
@@ -229,20 +231,23 @@ pub fn parse_handshake(rlp: UntrustedRlp) -> Result<(Status, Capabilities, FlowP
 		tx_relay: parser.expect_raw(Key::TxRelay).is_ok(),
 	};
 
-	let flow_params = FlowParams::new(
-		try!(parser.expect(Key::BufferLimit)),
-		try!(parser.expect(Key::BufferCostTable)),
-		try!(parser.expect(Key::BufferRechargeRate)),
-	);
+	let flow_params = match (
+		parser.expect(Key::BufferLimit),
+		parser.expect(Key::BufferCostTable),
+		parser.expect(Key::BufferRechargeRate)
+	) {
+		(Ok(bl), Ok(bct), Ok(brr)) => Some(FlowParams::new(bl, bct, brr)),
+		_ => None,
+	};
 
 	Ok((status, capabilities, flow_params))
 }
 
 /// Write a handshake, given status, capabilities, and flow parameters.
-pub fn write_handshake(status: &Status, capabilities: &Capabilities, flow_params: &FlowParams) -> Vec<u8> {
+pub fn write_handshake(status: &Status, capabilities: &Capabilities, flow_params: Option<&FlowParams>) -> Vec<u8> {
 	let mut pairs = Vec::new();
 	pairs.push(encode_pair(Key::ProtocolVersion, &status.protocol_version));
-	pairs.push(encode_pair(Key::NetworkId, &(status.network_id as u32)));
+	pairs.push(encode_pair(Key::NetworkId, &(status.network_id as u64)));
 	pairs.push(encode_pair(Key::HeadTD, &status.head_td));
 	pairs.push(encode_pair(Key::HeadHash, &status.head_hash));
 	pairs.push(encode_pair(Key::HeadNum, &status.head_num));
@@ -261,9 +266,11 @@ pub fn write_handshake(status: &Status, capabilities: &Capabilities, flow_params
 		pairs.push(encode_flag(Key::TxRelay));
 	}
 
-	pairs.push(encode_pair(Key::BufferLimit, flow_params.limit()));
-	pairs.push(encode_pair(Key::BufferCostTable, flow_params.cost_table()));
-	pairs.push(encode_pair(Key::BufferRechargeRate, flow_params.recharge_rate()));
+	if let Some(flow_params) = flow_params {
+		pairs.push(encode_pair(Key::BufferLimit, flow_params.limit()));
+		pairs.push(encode_pair(Key::BufferCostTable, flow_params.cost_table()));
+		pairs.push(encode_pair(Key::BufferRechargeRate, flow_params.recharge_rate()));
+	}
 
 	let mut stream = RlpStream::new_list(pairs.len());
 
@@ -293,7 +300,7 @@ pub struct Announcement {
 	pub serve_chain_since: Option<u64>,
 	/// optional new transaction-relay capability. false means "no change"
 	pub tx_relay: bool,
-	// TODO: changes in buffer flow?
+	// TODO: changes in request credits.
 }
 
 /// Parse an announcement.
@@ -301,10 +308,10 @@ pub fn parse_announcement(rlp: UntrustedRlp) -> Result<Announcement, DecoderErro
 	let mut last_key = None;
 
 	let mut announcement = Announcement {
-		head_hash: try!(rlp.val_at(0)),
-		head_num: try!(rlp.val_at(1)),
-		head_td: try!(rlp.val_at(2)),
-		reorg_depth: try!(rlp.val_at(3)),
+		head_hash: rlp.val_at(0)?,
+		head_num: rlp.val_at(1)?,
+		head_td: rlp.val_at(2)?,
+		reorg_depth: rlp.val_at(3)?,
 		serve_headers: false,
 		serve_state_since: None,
 		serve_chain_since: None,
@@ -316,14 +323,14 @@ pub fn parse_announcement(rlp: UntrustedRlp) -> Result<Announcement, DecoderErro
 		rlp: rlp,
 	};
 
-	while let Some((key, item)) = try!(parser.get_next()) {
+	while let Some((key, item)) = parser.get_next()? {
 		if Some(key) <= last_key { return Err(DecoderError::Custom("Invalid announcement key ordering")) }
 		last_key = Some(key);
 
 		match key {
 			Key::ServeHeaders => announcement.serve_headers = true,
-			Key::ServeStateSince => announcement.serve_state_since = Some(try!(item.as_val())),
-			Key::ServeChainSince => announcement.serve_chain_since = Some(try!(item.as_val())),
+			Key::ServeStateSince => announcement.serve_state_since = Some(item.as_val()?),
+			Key::ServeChainSince => announcement.serve_chain_since = Some(item.as_val()?),
 			Key::TxRelay => announcement.tx_relay = true,
 			_ => return Err(DecoderError::Custom("Nonsensical key in announcement")),
 		}
@@ -365,15 +372,15 @@ pub fn write_announcement(announcement: &Announcement) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use super::super::buffer_flow::FlowParams;
-	use util::{U256, H256, FixedHash};
-	use rlp::{RlpStream, Stream ,UntrustedRlp, View};
+	use super::super::request_credits::FlowParams;
+	use ethereum_types::{U256, H256};
+	use rlp::{RlpStream, UntrustedRlp};
 
 	#[test]
 	fn full_handshake() {
 		let status = Status {
 			protocol_version: 1,
-			network_id: NetworkId::Mainnet,
+			network_id: 1,
 			head_td: U256::default(),
 			head_hash: H256::default(),
 			head_num: 10,
@@ -394,21 +401,21 @@ mod tests {
 			1000.into(),
 		);
 
-		let handshake = write_handshake(&status, &capabilities, &flow_params);
+		let handshake = write_handshake(&status, &capabilities, Some(&flow_params));
 
 		let (read_status, read_capabilities, read_flow)
 			= parse_handshake(UntrustedRlp::new(&handshake)).unwrap();
 
 		assert_eq!(read_status, status);
 		assert_eq!(read_capabilities, capabilities);
-		assert_eq!(read_flow, flow_params);
+		assert_eq!(read_flow.unwrap(), flow_params);
 	}
 
 	#[test]
 	fn partial_handshake() {
 		let status = Status {
 			protocol_version: 1,
-			network_id: NetworkId::Mainnet,
+			network_id: 1,
 			head_td: U256::default(),
 			head_hash: H256::default(),
 			head_num: 10,
@@ -429,21 +436,21 @@ mod tests {
 			1000.into(),
 		);
 
-		let handshake = write_handshake(&status, &capabilities, &flow_params);
+		let handshake = write_handshake(&status, &capabilities, Some(&flow_params));
 
 		let (read_status, read_capabilities, read_flow)
 			= parse_handshake(UntrustedRlp::new(&handshake)).unwrap();
 
 		assert_eq!(read_status, status);
 		assert_eq!(read_capabilities, capabilities);
-		assert_eq!(read_flow, flow_params);
+		assert_eq!(read_flow.unwrap(), flow_params);
 	}
 
 	#[test]
 	fn skip_unknown_keys() {
 		let status = Status {
 			protocol_version: 1,
-			network_id: NetworkId::Mainnet,
+			network_id: 1,
 			head_td: U256::default(),
 			head_hash: H256::default(),
 			head_num: 10,
@@ -464,10 +471,10 @@ mod tests {
 			1000.into(),
 		);
 
-		let handshake = write_handshake(&status, &capabilities, &flow_params);
+		let handshake = write_handshake(&status, &capabilities, Some(&flow_params));
 		let interleaved = {
 			let handshake = UntrustedRlp::new(&handshake);
-			let mut stream = RlpStream::new_list(handshake.item_count() * 3);
+			let mut stream = RlpStream::new_list(handshake.item_count().unwrap_or(0) * 3);
 
 			for item in handshake.iter() {
 				stream.append_raw(item.as_raw(), 1);
@@ -486,7 +493,7 @@ mod tests {
 
 		assert_eq!(read_status, status);
 		assert_eq!(read_capabilities, capabilities);
-		assert_eq!(read_flow, flow_params);
+		assert_eq!(read_flow.unwrap(), flow_params);
 	}
 
 	#[test]
@@ -535,5 +542,34 @@ mod tests {
 
 		let out = stream.drain();
 		assert!(parse_announcement(UntrustedRlp::new(&out)).is_ok());
+	}
+
+	#[test]
+	fn optional_flow() {
+		let status = Status {
+			protocol_version: 1,
+			network_id: 1,
+			head_td: U256::default(),
+			head_hash: H256::default(),
+			head_num: 10,
+			genesis_hash: H256::zero(),
+			last_head: None,
+		};
+
+		let capabilities = Capabilities {
+			serve_headers: true,
+			serve_chain_since: Some(5),
+			serve_state_since: Some(8),
+			tx_relay: true,
+		};
+
+		let handshake = write_handshake(&status, &capabilities, None);
+
+		let (read_status, read_capabilities, read_flow)
+			= parse_handshake(UntrustedRlp::new(&handshake)).unwrap();
+
+		assert_eq!(read_status, status);
+		assert_eq!(read_capabilities, capabilities);
+		assert!(read_flow.is_none());
 	}
 }
